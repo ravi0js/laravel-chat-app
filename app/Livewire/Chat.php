@@ -2,85 +2,195 @@
 
 namespace App\Livewire;
 
-use Livewire\Component;
+use App\Events\MessageSentEvent;
+use App\Events\UnreadMessage;
+use App\Events\UserTyping;
+use App\Models\Message;
+use App\Models\User;
 use Illuminate\Support\Facades\Auth;
-use App\Models\User;  
-use App\Models\Message;  
+use Illuminate\Support\Facades\Log;
+use Livewire\Attributes\On;
+use Livewire\Component;
+use Livewire\WithFileUploads;
 
 class Chat extends Component
 {
+    use WithFileUploads;
+
     public $user;
-    public $message;
     public $senderId;
     public $receiverId;
-    public $messages;
-    // Mount method to initialize the user based on userId
+    public $message;
+    public $messages = [];
+    public $file;
+
     public function mount($userId)
     {
-        // Fetch the user with the provided userId
-        $this->user = $this->getUser($userId);
+        Log::info("Chat Component Mounted: User ID = {$userId}");
 
-        $this->senderId = Auth::User()->id;
-        $this->receiverId=$userId;
-        
-        // fetch massage
+        $this->dispatch('messages-updated');
+
+        $this->senderId   = Auth::id();
+        $this->receiverId = $userId;
+
+        # Get User
+        $this->user = $this->getUser($userId);
+        Log::info("User Retrieved:", ['user' => $this->user]);
+
+        # Get Messages
         $this->messages = $this->getMessages();
+        Log::info("Messages Retrieved:", ['messages' => $this->messages]);
+
+        # Read Messages
+        $this->markMessagesAsRead();
     }
 
-    // Render method that returns the view
     public function render()
     {
-        return view('livewire.chat');  // Make sure to pass $user to the view if you want to display it
+        Log::info("Rendering Chat Component for Sender ID: {$this->senderId} and Receiver ID: {$this->receiverId}");
+
+        # Read Messages
+        $this->markMessagesAsRead();
+
+        return view('livewire.chat');
     }
 
-    /**
-     * Get the user by userId
-     * 
-     * @param int $userId
-     * @return \App\Models\User|null
-     */
     public function getUser($userId)
     {
-        return User::find($userId);  // Find user by ID or return null if not found
+        return User::find($userId);
     }
-     /**
-     * Function getMessages
-     */
-    public function getMessages()
-    {
-        return Message::with('sender','receiver')
-        ->where( function($query){
-            $query->where('sender_id',$this->senderId)
-            ->where('receiver_id',$this->receiverId);
-        })
-        ->orWhere(function($query)
-        {
-            $query->where('sender_id',$this->receiverId)
-            ->where('receiver_id',$this->senderId);   
-        })->get();
-    }
-    /**
-     * Function sendMessage
-     */
+
     public function sendMessage()
     {
-        $this->saveMessage();
-        $this->message='';
+        if (!$this->message && !$this->file) {
+            Log::warning("No message or file found to send.");
+            return;
+        }
+
+        Log::info("Sending Message from {$this->senderId} to {$this->receiverId}");
+
+        $sentMessage = $this->saveMessage()->load('sender:id,name', 'receiver:id,name');
+
+        # Append message manually for sender
+        $this->messages[] = $sentMessage;
+        Log::info("Message Saved:", ['message' => $sentMessage]);
+
+        # Broadcast Sent Message Event
+        broadcast(new MessageSentEvent($sentMessage))->toOthers();
+        Log::info("Broadcasted MessageSentEvent");
+
+        # Calculate unread messages for receiver
+        $unreadCount = $this->getUnreadMessagesCount();
+        Log::info("Unread Messages for Receiver {$this->receiverId}: {$unreadCount}");
+
+        # Broadcast unread message count
+        broadcast(new UnreadMessage($this->receiverId, $this->senderId, $unreadCount))->toOthers();
+        Log::info("Broadcasted UnreadMessage Event");
+
+        $this->message = null;
+        $this->file    = null;
+
+        # Emit scroll event
+        $this->dispatch('messages-updated');
     }
-    /**
-     * Function: saveMessage
-     */
+
+    #[On('echo-private:chat-channel.{senderId},MessageSentEvent')]
+    public function listenMessage($event)
+    {
+        Log::info("Received MessageSentEvent via WebSockets", ['event' => $event]);
+
+        $newMessage = Message::find($event['message']['id'])->load('sender:id,name', 'receiver:id,name');
+
+        $this->messages[] = $newMessage;
+    }
+
     public function saveMessage()
     {
+        Log::info("Saving Message");
+
+        $filePath         = null;
+        $fileOriginalName = null;
+        $fileName         = null;
+        $fileType         = null;
+
+        if ($this->file) {
+            Log::info("Processing File Upload");
+
+            $fileOriginalName = $this->file->getClientOriginalName();
+            $fileName         = $this->file->hashName();
+            $filePath         = $this->file->store('chat_files', 'public');
+            $fileType         = $this->file->getMimeType();
+
+            Log::info("File Uploaded", [
+                'file_original_name' => $fileOriginalName,
+                'file_name'          => $fileName,
+                'file_path'          => $filePath,
+                'file_type'          => $fileType,
+            ]);
+        }
+
         return Message::create([
-            'sender_id'=>$this -> senderId,
-            'receiver_id'=> $this -> receiverId,
-            'message'=> $this -> message,
-            // 'file_name',
-            // 'file_original_name',
-            // 'folder_path',
-            'is_read'=>false
+            'message'           => $this->message,
+            'sender_id'         => $this->senderId,
+            'receiver_id'       => $this->receiverId,
+            'file_name'         => $fileName,
+            'file_original_name'=> $fileOriginalName,
+            'file_path'         => $filePath,
+            'file_type'         => $fileType,
         ]);
     }
-}
 
+    public function getMessages()
+    {
+        Log::info("Fetching Messages for Chat");
+
+        return Message::with('sender:id,name', 'receiver:id,name')
+            ->where(function ($query) {
+                $query->where('sender_id', $this->senderId)
+                    ->where('receiver_id', $this->receiverId);
+            })
+            ->orWhere(function ($query) {
+                $query->where('sender_id', $this->receiverId)
+                    ->where('receiver_id', $this->senderId);
+            })
+            ->get();
+    }
+
+    public function userTyping()
+    {
+        Log::info("User Typing Event from {$this->senderId} to {$this->receiverId}");
+
+        broadcast(new UserTyping($this->senderId, $this->receiverId))->toOthers();
+    }
+
+    public function getUnreadMessagesCount()
+    {
+        $count = Message::where('receiver_id', $this->receiverId)
+            ->where('is_read', false)
+            ->count();
+
+        Log::info("Unread Messages Count for Receiver {$this->receiverId}: {$count}");
+
+        return $count;
+    }
+
+    public function markMessagesAsRead()
+    {
+        Log::info("Marking Messages as Read for Sender {$this->senderId} and Receiver {$this->receiverId}");
+
+        Message::where('receiver_id', $this->senderId)
+            ->where('sender_id', $this->receiverId)
+            ->where('is_read', false)
+            ->update(['is_read' => true]);
+
+        broadcast(new UnreadMessage($this->senderId, $this->receiverId, 0))->toOthers();
+    }
+
+    public function sendFileMessage()
+    {
+        if ($this->file) {
+            Log::info("File Selected for Sending");
+            $this->sendMessage();
+        }
+    }
+}

@@ -16,10 +16,11 @@ return new class extends Migration
             $table->foreignId('sender_id');
             $table->foreignId('receiver_id');
             $table->text('message')->nullable();
-            $table->string('file_name')->nullable();
-            $table->string('file_original_name')->nullable();
-            $table->string('folder_path')->nullable();
             $table->boolean('is_read')->default(false);
+            $table->string('file_name')->nullable();
+            $table->string('file_name_original')->nullable();
+            $table->string('file_path')->nullable();
+            $table->string('file_type')->nullable();
             $table->timestamps();
         });
     }
