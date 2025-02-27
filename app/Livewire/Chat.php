@@ -1,5 +1,4 @@
 <?php
-
 namespace App\Livewire;
 
 use App\Events\MessageSentEvent;
@@ -8,7 +7,6 @@ use App\Events\UserTyping;
 use App\Models\Message;
 use App\Models\User;
 use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Log;
 use Livewire\Attributes\On;
 use Livewire\Component;
 use Livewire\WithFileUploads;
@@ -23,23 +21,22 @@ class Chat extends Component
     public $message;
     public $messages = [];
     public $file;
+    public $search         = '';
+    public $matchedIndexes = [];
+    public $currentMatch   = 0;
 
     public function mount($userId)
     {
-        Log::info("Chat Component Mounted: User ID = {$userId}");
-
         $this->dispatch('messages-updated');
 
-        $this->senderId   = Auth::id();
+        $this->senderId   = Auth::user()->id;
         $this->receiverId = $userId;
 
         # Get User
         $this->user = $this->getUser($userId);
-        Log::info("User Retrieved:", ['user' => $this->user]);
 
         # Get Messages
         $this->messages = $this->getMessages();
-        Log::info("Messages Retrieved:", ['messages' => $this->messages]);
 
         # Read Messages
         $this->markMessagesAsRead();
@@ -47,103 +44,99 @@ class Chat extends Component
 
     public function render()
     {
-        Log::info("Rendering Chat Component for Sender ID: {$this->senderId} and Receiver ID: {$this->receiverId}");
-
         # Read Messages
         $this->markMessagesAsRead();
 
         return view('livewire.chat');
     }
 
+    /**
+     * Function: getUser
+     * @param userId
+     * @return App\Models\User
+     */
     public function getUser($userId)
     {
         return User::find($userId);
     }
 
+    /**
+     * Function: sendMessage
+     * @param NA
+     * @return
+     */
     public function sendMessage()
     {
-        if (!$this->message && !$this->file) {
-            Log::warning("No message or file found to send.");
+        if (! $this->message && ! $this->file) {
             return;
         }
 
-        Log::info("Sending Message from {$this->senderId} to {$this->receiverId}");
-
         $sentMessage = $this->saveMessage()->load('sender:id,name', 'receiver:id,name');
 
-        # Append message manually for sender
+        // Append the new message manually for the sender's side
         $this->messages[] = $sentMessage;
-        Log::info("Message Saved:", ['message' => $sentMessage]);
 
         # Broadcast Sent Message Event
         broadcast(new MessageSentEvent($sentMessage))->toOthers();
-        Log::info("Broadcasted MessageSentEvent");
 
-        # Calculate unread messages for receiver
+        # Calculate unread messages for the receiver
         $unreadCount = $this->getUnreadMessagesCount();
-        Log::info("Unread Messages for Receiver {$this->receiverId}: {$unreadCount}");
 
         # Broadcast unread message count
         broadcast(new UnreadMessage($this->receiverId, $this->senderId, $unreadCount))->toOthers();
-        Log::info("Broadcasted UnreadMessage Event");
 
         $this->message = null;
         $this->file    = null;
 
-        # Emit scroll event
+        # Emit the scroll event
         $this->dispatch('messages-updated');
     }
 
     #[On('echo-private:chat-channel.{senderId},MessageSentEvent')]
     public function listenMessage($event)
     {
-        Log::info("Received MessageSentEvent via WebSockets", ['event' => $event]);
-
+        # Convert the event message array into an Eloquent model with relationships
         $newMessage = Message::find($event['message']['id'])->load('sender:id,name', 'receiver:id,name');
 
         $this->messages[] = $newMessage;
     }
 
+    /**
+     * Save Message
+     * @return
+     */
     public function saveMessage()
     {
-        Log::info("Saving Message");
-
         $filePath         = null;
         $fileOriginalName = null;
         $fileName         = null;
         $fileType         = null;
 
         if ($this->file) {
-            Log::info("Processing File Upload");
-
             $fileOriginalName = $this->file->getClientOriginalName();
             $fileName         = $this->file->hashName();
             $filePath         = $this->file->store('chat_files', 'public');
             $fileType         = $this->file->getMimeType();
-
-            Log::info("File Uploaded", [
-                'file_original_name' => $fileOriginalName,
-                'file_name'          => $fileName,
-                'file_path'          => $filePath,
-                'file_type'          => $fileType,
-            ]);
         }
 
         return Message::create([
-            'message'           => $this->message,
-            'sender_id'         => $this->senderId,
-            'receiver_id'       => $this->receiverId,
-            'file_name'         => $fileName,
-            'file_original_name'=> $fileOriginalName,
-            'file_path'         => $filePath,
-            'file_type'         => $fileType,
+            'message'            => $this->message,
+            'sender_id'          => $this->senderId,
+            'receiver_id'        => $this->receiverId,
+            'file_name'          => $fileName,
+            'file_name_original' => $fileOriginalName,
+            'file_path'          => $filePath,
+            'file_type'          => $fileType,
         ]);
     }
 
+    /**
+     * Function: getMessages
+     * @param
+     * @return
+     */
     public function getMessages()
     {
-        Log::info("Fetching Messages for Chat");
-
         return Message::with('sender:id,name', 'receiver:id,name')
             ->where(function ($query) {
                 $query->where('sender_id', $this->senderId)
@@ -156,41 +149,126 @@ class Chat extends Component
             ->get();
     }
 
+    /**
+     * Function: userTyping
+     */
     public function userTyping()
     {
-        Log::info("User Typing Event from {$this->senderId} to {$this->receiverId}");
-
         broadcast(new UserTyping($this->senderId, $this->receiverId))->toOthers();
     }
 
+    /**
+     * Function: getUnreadMessagesCount
+     * @return unreadMessagesCount
+     */
     public function getUnreadMessagesCount()
     {
-        $count = Message::where('receiver_id', $this->receiverId)
+        return Message::where('receiver_id', $this->receiverId)
             ->where('is_read', false)
             ->count();
-
-        Log::info("Unread Messages Count for Receiver {$this->receiverId}: {$count}");
-
-        return $count;
     }
 
+    /**
+     * Function: markMessagesAsRead
+     */
     public function markMessagesAsRead()
     {
-        Log::info("Marking Messages as Read for Sender {$this->senderId} and Receiver {$this->receiverId}");
-
         Message::where('receiver_id', $this->senderId)
             ->where('sender_id', $this->receiverId)
             ->where('is_read', false)
             ->update(['is_read' => true]);
 
+        # Broadcast unread message count
         broadcast(new UnreadMessage($this->senderId, $this->receiverId, 0))->toOthers();
     }
 
+    /**
+     * Automatically send file when selected
+     */
     public function sendFileMessage()
     {
         if ($this->file) {
-            Log::info("File Selected for Sending");
             $this->sendMessage();
         }
+    }
+
+    /**
+     * Function: highlightText
+     */
+    public function highlightText($text, $search)
+    {
+        // Escape the search term to safely insert into the regex.
+        $escaped = preg_quote($search, '/');
+        // Use preg_replace to wrap matched terms in a <mark> tag.
+        return preg_replace('/(' . $escaped . ')/i', '<mark>$1</mark>', e($text));
+    }
+
+    public function updatedSearch()
+    {
+        # Reset matches on new search
+        $this->matchedIndexes = [];
+
+        if (! empty($this->search)) {
+            foreach ($this->messages as $index => $message) {
+                if (stripos($message->message, $this->search) !== false) {
+                    $this->matchedIndexes[] = $index;
+                }
+            }
+        }
+
+        // Reset to first match
+        $this->currentMatch = count($this->matchedIndexes) > 0 ? 0 : -1;
+
+        // Scroll to the first match
+        if ($this->currentMatch !== -1) {
+            $this->scrollToMatch();
+        }
+    }
+
+    /**
+     * Function: nextMatch
+     */
+    public function nextMatch()
+    {
+        if (count($this->matchedIndexes) > 0) {
+            $this->currentMatch = ($this->currentMatch + 1) % count($this->matchedIndexes);
+            $this->scrollToMatch();
+        }
+    }
+
+    /**
+     * Function: prevMatch
+     */
+    public function prevMatch()
+    {
+        if (count($this->matchedIndexes) > 0) {
+            $this->currentMatch = ($this->currentMatch - 1 + count($this->matchedIndexes)) % count($this->matchedIndexes);
+            $this->scrollToMatch();
+        }
+    }
+
+    /**
+     * Function: scrollToMatch
+     */
+    public function scrollToMatch()
+    {
+        $index = $this->matchedIndexes[$this->currentMatch] ?? null;
+
+        if (! is_null($index)) {
+            $this->dispatch('scroll-to-message', index: $index);
+        }
+    }
+
+    /**
+     * Function: resetSearch
+     */
+    public function resetSearch()
+    {
+        $this->search         = '';
+        $this->matchedIndexes = [];
+        $this->currentMatch   = -1;
+
+        # Scroll to latest message
+        $this->dispatch('messages-updated');
     }
 }
